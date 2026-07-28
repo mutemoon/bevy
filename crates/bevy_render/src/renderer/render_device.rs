@@ -22,6 +22,47 @@ impl From<wgpu::Device> for RenderDevice {
     }
 }
 
+#[cfg(feature = "spirv_shader_passthrough")]
+fn spirv_passthrough_entry_points(
+    words: &[u32],
+) -> Vec<wgpu::PassthroughShaderEntryPoint<'static>> {
+    const OP_ENTRY_POINT: u16 = 15;
+    const HEADER_WORDS: usize = 5;
+    let mut entry_points = Vec::new();
+    if words.len() <= HEADER_WORDS {
+        return entry_points;
+    }
+    let mut i = HEADER_WORDS;
+    while i < words.len() {
+        let word_count = (words[i] >> 16) as usize;
+        let opcode = (words[i] & 0xFFFF) as u16;
+        if word_count == 0 {
+            break;
+        }
+        // OpEntryPoint: [op] [ExecutionModel] [EntryPoint id] [Name...] [Interface...]
+        if opcode == OP_ENTRY_POINT && word_count >= 4 {
+            let name_end = (i + word_count).min(words.len());
+            let mut bytes = Vec::new();
+            'name: for w in &words[i + 3..name_end] {
+                for b in w.to_le_bytes() {
+                    if b == 0 {
+                        break 'name;
+                    }
+                    bytes.push(b);
+                }
+            }
+            if let Ok(name) = String::from_utf8(bytes) {
+                entry_points.push(wgpu::PassthroughShaderEntryPoint {
+                    name: name.into(),
+                    workgroup_size: (0, 0, 0),
+                });
+            }
+        }
+        i += word_count;
+    }
+    entry_points
+}
+
 impl RenderDevice {
     pub fn new(device: WgpuWrapper<wgpu::Device>) -> Self {
         Self { device }
@@ -66,10 +107,12 @@ impl RenderDevice {
                 // SAFETY:
                 // This call passes binary data to the backend as-is and can potentially result in a driver crash or bogus behavior.
                 // No attempt is made to ensure that data is valid SPIR-V.
+                let entry_points = spirv_passthrough_entry_points(source);
                 unsafe {
                     self.device.create_shader_module_passthrough(
                         wgpu::ShaderModuleDescriptorPassthrough {
                             label: desc.label,
+                            entry_points: entry_points.into(),
                             spirv: Some(source.clone()),
                             ..Default::default()
                         },
